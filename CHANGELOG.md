@@ -85,6 +85,8 @@ Initial stable release.
 ### [3.29.0](https://github.com/flutter/flutter/releases/tag/3.29.0)
 Initial stable release.
 
+- [flutter/161334](https://github.com/flutter/flutter/issues/161334) Disable Vulkan on certain Xclipse GPU models.
+
 ## Flutter 3.27 Changes
 
 ### [3.27.4](https://github.com/flutter/flutter/releases/tag/3.27.4)
