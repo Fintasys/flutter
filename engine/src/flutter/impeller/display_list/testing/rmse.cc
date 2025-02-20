@@ -4,7 +4,6 @@
 
 #include "impeller/display_list/testing/rmse.h"
 
-#include <cmath>
 #include "flutter/fml/logging.h"
 
 namespace flutter {

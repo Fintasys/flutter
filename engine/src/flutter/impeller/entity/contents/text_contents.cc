@@ -57,32 +57,25 @@ std::optional<Rect> TextContents::GetCoverage(const Entity& entity) const {
   return frame_->GetBounds().TransformBounds(entity.GetTransform());
 }
 
-void TextContents::SetTextProperties(
-    Color color,
-    const std::optional<StrokeParameters>& stroke) {
+void TextContents::SetTextProperties(Color color,
+                                     bool stroke,
+                                     Scalar stroke_width,
+                                     Cap stroke_cap,
+                                     Join stroke_join,
+                                     Scalar stroke_miter) {
   if (frame_->HasColor()) {
     // Alpha is always applied when rendering, remove it here so
     // we do not double-apply the alpha.
     properties_.color = color.WithAlpha(1.0);
   }
-  properties_.stroke = stroke;
-}
-
-namespace {
-Scalar AttractToOne(Scalar x) {
-  // Epsilon was decided by looking at the floating point inaccuracies in
-  // the ScaledK test.
-  const Scalar epsilon = 0.005f;
-  if (std::abs(x - 1.f) < epsilon) {
-    return 1.f;
+  if (stroke) {
+    properties_.stroke = true;
+    properties_.stroke_width = stroke_width;
+    properties_.stroke_cap = stroke_cap;
+    properties_.stroke_join = stroke_join;
+    properties_.stroke_miter = stroke_miter;
   }
-  if (std::abs(x + 1.f) < epsilon) {
-    return -1.f;
-  }
-  return x;
 }
-
-}  // namespace
 
 void TextContents::ComputeVertexData(
     VS::PerVertexData* vtx_contents,
@@ -99,7 +92,8 @@ void TextContents::ComputeVertexData(
   // interpolated vertex information is also used in the fragment shader to
   // sample from the glyph atlas.
 
-  constexpr std::array<Point, 4> unit_points = {Point{0, 0}, Point{1, 0},
+  constexpr std::array<Point, 6> unit_points = {Point{0, 0}, Point{1, 0},
+                                                Point{0, 1}, Point{1, 0},
                                                 Point{0, 1}, Point{1, 1}};
 
   ISize atlas_size = atlas->GetTexture()->GetSize();
@@ -109,20 +103,9 @@ void TextContents::ComputeVertexData(
   VS::PerVertexData vtx;
   size_t i = 0u;
   size_t bounds_offset = 0u;
-  Rational rounded_scale = frame->GetScale();
-  Scalar inverted_rounded_scale = static_cast<Scalar>(rounded_scale.Invert());
-  Matrix unscaled_basis =
-      basis_transform *
-      Matrix::MakeScale({inverted_rounded_scale, inverted_rounded_scale, 1});
-
-  // In typical scales < 48x these values should be -1 or 1. We round to
-  // those to avoid inaccuracies.
-  unscaled_basis.m[0] = AttractToOne(unscaled_basis.m[0]);
-  unscaled_basis.m[5] = AttractToOne(unscaled_basis.m[5]);
-
   for (const TextRun& run : frame->GetRuns()) {
     const Font& font = run.GetFont();
-    const Matrix transform = frame->GetOffsetTransform();
+    Scalar rounded_scale = TextFrame::RoundScaledFontSize(scale);
     FontGlyphAtlas* font_atlas = nullptr;
 
     // Adjust glyph position based on the subpixel rounding
@@ -165,8 +148,8 @@ void TextContents::ComputeVertexData(
           VALIDATION_LOG << "Could not find font in the atlas.";
           continue;
         }
-        SubpixelPosition subpixel = TextFrame::ComputeSubpixelPosition(
-            glyph_position, font.GetAxisAlignment(), transform);
+        Point subpixel = TextFrame::ComputeSubpixelPosition(
+            glyph_position, font.GetAxisAlignment(), entity_transform);
 
         std::optional<FrameBounds> maybe_atlas_glyph_bounds =
             font_atlas->FindGlyphBounds(SubpixelGlyph{
@@ -181,18 +164,20 @@ void TextContents::ComputeVertexData(
         atlas_glyph_bounds = maybe_atlas_glyph_bounds.value().atlas_bounds;
       }
 
-      Rect scaled_bounds = glyph_bounds.Scale(inverted_rounded_scale);
+      Rect scaled_bounds = glyph_bounds.Scale(1.0 / rounded_scale);
       // For each glyph, we compute two rectangles. One for the vertex
       // positions and one for the texture coordinates (UVs). The atlas
       // glyph bounds are used to compute UVs in cases where the
       // destination and source sizes may differ due to clamping the sizes
       // of large glyphs.
-      Point uv_origin = atlas_glyph_bounds.GetLeftTop() / atlas_size;
+      Point uv_origin = (atlas_glyph_bounds.GetLeftTop()) / atlas_size;
       Point uv_size = SizeToPoint(atlas_glyph_bounds.GetSize()) / atlas_size;
 
       Point unrounded_glyph_position =
           // This is for RTL text.
-          unscaled_basis * glyph_bounds.GetLeftTop() +
+          (basis_transform.m[0] < 0 ? Matrix::MakeScale({-1, 1, 1})
+                                    : Matrix()) *
+              glyph_bounds.GetLeftTop() +
           (basis_transform * glyph_position.position);
 
       Point screen_glyph_position =
@@ -202,7 +187,7 @@ void TextContents::ComputeVertexData(
         Point position;
         if (is_translation_scale) {
           position = (screen_glyph_position +
-                      (unscaled_basis * point * glyph_bounds.GetSize()))
+                      (basis_transform * point * scaled_bounds.GetSize()))
                          .Round();
         } else {
           position = entity_transform *
@@ -220,12 +205,12 @@ void TextContents::ComputeVertexData(
 bool TextContents::Render(const ContentContext& renderer,
                           const Entity& entity,
                           RenderPass& pass) const {
-  Color color = GetColor();
+  auto color = GetColor();
   if (color.IsTransparent()) {
     return true;
   }
 
-  GlyphAtlas::Type type = frame_->GetAtlasType();
+  auto type = frame_->GetAtlasType();
   const std::shared_ptr<GlyphAtlas>& atlas =
       renderer.GetLazyGlyphAtlas()->CreateOrGetGlyphAtlas(
           *renderer.GetContext(), renderer.GetTransientsBuffer(), type);
@@ -287,45 +272,26 @@ bool TextContents::Render(const ContentContext& renderer,
           sampler_desc)  // sampler
   );
 
-  HostBuffer& host_buffer = renderer.GetTransientsBuffer();
-  size_t glyph_count = 0;
+  auto& host_buffer = renderer.GetTransientsBuffer();
+  size_t vertex_count = 0;
   for (const auto& run : frame_->GetRuns()) {
-    glyph_count += run.GetGlyphPositions().size();
+    vertex_count += run.GetGlyphPositions().size();
   }
-  size_t vertex_count = glyph_count * 4;
-  size_t index_count = glyph_count * 6;
+  vertex_count *= 6;
 
   BufferView buffer_view = host_buffer.Emplace(
       vertex_count * sizeof(VS::PerVertexData), alignof(VS::PerVertexData),
-      [&](uint8_t* data) {
+      [&](uint8_t* contents) {
         VS::PerVertexData* vtx_contents =
-            reinterpret_cast<VS::PerVertexData*>(data);
-        ComputeVertexData(/*vtx_contents=*/vtx_contents,
-                          /*frame=*/frame_,
-                          /*scale=*/scale_,
-                          /*entity_transform=*/entity_transform,
-                          /*offset=*/offset_,
-                          /*glyph_properties=*/GetGlyphProperties(),
-                          /*atlas=*/atlas);
-      });
-  BufferView index_buffer_view = host_buffer.Emplace(
-      index_count * sizeof(uint16_t), alignof(uint16_t), [&](uint8_t* data) {
-        uint16_t* indices = reinterpret_cast<uint16_t*>(data);
-        size_t j = 0;
-        for (auto i = 0u; i < glyph_count; i++) {
-          size_t base = i * 4;
-          indices[j++] = base + 0;
-          indices[j++] = base + 1;
-          indices[j++] = base + 2;
-          indices[j++] = base + 1;
-          indices[j++] = base + 2;
-          indices[j++] = base + 3;
-        }
+            reinterpret_cast<VS::PerVertexData*>(contents);
+        ComputeVertexData(vtx_contents, frame_, scale_,
+                          /*entity_transform=*/entity_transform, offset_,
+                          GetGlyphProperties(), atlas);
       });
 
   pass.SetVertexBuffer(std::move(buffer_view));
-  pass.SetIndexBuffer(index_buffer_view, IndexType::k16bit);
-  pass.SetElementCount(index_count);
+  pass.SetIndexBuffer({}, IndexType::kNone);
+  pass.SetElementCount(vertex_count);
 
   return pass.Draw().ok();
 }

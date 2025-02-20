@@ -119,6 +119,8 @@ class TextFrame {
 
   Matrix GetOffsetTransform() const;
 
+  const Matrix& GetTransform() const { return transform_; }
+
  private:
   friend class TypographerContextSkia;
   friend class LazyGlyphAtlas;
