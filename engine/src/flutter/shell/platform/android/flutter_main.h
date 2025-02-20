@@ -29,6 +29,8 @@ class FlutterMain {
       const flutter::Settings& settings,
       int api_level);
 
+  static bool IsKnownBadSOC(std::string_view hardware);
+
  private:
   const flutter::Settings settings_;
   const flutter::AndroidRenderingAPI android_rendering_api_;
